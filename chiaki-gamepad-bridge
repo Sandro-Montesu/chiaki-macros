@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""chiaki-gamepad-bridge — persistent UInput gamepad with Unix socket.
+Starts BEFORE Chiaki so Chiaki detects the gamepad at init time.
+chiaki-macro sends events through the socket instead of creating its own UInput.
+Supports multiple concurrent clients (multiple macro runs)."""
+
+import json
+import os
+import socket
+import sys
+import select
+from evdev import UInput, AbsInfo, ecodes
+
+SOCK_PATH = "/tmp/chiaki-gamepad.sock"
+PROFILE_PATH = "/tmp/chiaki-bridge-profile.json"
+
+K_TYPE = "t"
+K_CODE = "c"
+K_VALUE = "v"
+K_EVENTS = "e"
+
+
+def create_uinput(profile):
+    caps = {ecodes.EV_KEY: profile["ev_key"]}
+    abs_list = []
+    for a in profile["ev_abs"]:
+        abs_list.append((
+            a[K_CODE],
+            AbsInfo(a[K_VALUE], a["min"], a["max"],
+                    a["flat"], a["fuzz"], a["resolution"]),
+        ))
+    caps[ecodes.EV_ABS] = abs_list
+    vname = f"Chiaki Bridge [{profile.get('name', 'gamepad')}]"
+    return UInput(
+        events=caps, name=vname,
+        vendor=profile["vendor"], product=profile["product"],
+        version=profile["version"], bustype=profile["bustype"],
+    )
+
+
+def main():
+    if not os.path.exists(PROFILE_PATH):
+        print("ERROR: bridge profile not found, run chiaki-headless start first",
+              file=sys.stderr)
+        sys.exit(1)
+
+    with open(PROFILE_PATH) as f:
+        profile = json.load(f)
+
+    # Create UInput — this is the device Chiaki will detect
+    uinput = create_uinput(profile)
+    print(f"Bridge ready: {uinput.device.path}", flush=True)
+
+    # Unix socket for clients (chiaki-macro)
+    if os.path.exists(SOCK_PATH):
+        os.unlink(SOCK_PATH)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(SOCK_PATH)
+    sock.listen(5)
+    sock.setblocking(False)
+
+    clients = set()
+
+    # Cleanup on exit
+    def cleanup():
+        for c in clients:
+            try:
+                c.close()
+            except Exception:
+                pass
+        sock.close()
+        os.unlink(SOCK_PATH)
+        uinput.close()
+
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    buf_map = {}
+
+    try:
+        while True:
+            rlist = [sock] + list(clients)
+            r, _, _ = select.select(rlist, [], [], 0.5)
+
+            for fd in r:
+                if fd is sock:
+                    conn, _ = sock.accept()
+                    conn.setblocking(False)
+                    clients.add(conn)
+                    buf_map[conn] = b""
+                else:
+                    try:
+                        data = fd.recv(4096)
+                    except Exception:
+                        data = b""
+                    if not data:
+                        clients.discard(fd)
+                        buf_map.pop(fd, None)
+                        fd.close()
+                        continue
+                    buf_map[fd] += data
+                    while b"\n" in buf_map[fd]:
+                        line, buf_map[fd] = buf_map[fd].split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            uinput.syn()
+                            continue
+                        try:
+                            parts = line.split()
+                            t, c, v = int(parts[0]), int(parts[1]), int(parts[2])
+                            uinput.write(t, c, v)
+                        except (ValueError, IndexError):
+                            pass
+    except SystemExit:
+        pass
+    finally:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

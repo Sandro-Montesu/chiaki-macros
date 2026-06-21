@@ -5,7 +5,7 @@ _chiaki_macro() {
     local cur prev words cword
     _init_completion || return
 
-    local cmds="list devices record play delete import orchestrate collage ocr-test orchestrate-init"
+    local cmds="list devices record play delete import orchestrate collage ocr-test orchestrate-init headless-start headless-stop headless-status"
 
     case $prev in
         play|delete)
@@ -69,3 +69,28 @@ except: pass
 }
 
 complete -F _chiaki_macro chiaki-macro
+
+# Bash completion for chiaki-headless
+_chiaki_headless() {
+    local cur prev words cword
+    _init_completion || return
+
+    local cmds="start stop status"
+
+    if (( cword == 1 )); then
+        COMPREPLY=($(compgen -W "$cmds" -- "$cur"))
+        return
+    fi
+
+    case ${words[1]} in
+        start)
+            if (( cword == 2 )); then
+                # Auto-detect nickname from Chiaki config
+                local nickname=$(grep -Po 'server_nickname=\K.*' "$HOME/.config/Chiaki/Chiaki.conf" 2>/dev/null | tr -d ' ')
+                COMPREPLY=($(compgen -W "$nickname" -- "$cur"))
+            fi
+            ;;
+    esac
+}
+
+complete -F _chiaki_headless chiaki-headless

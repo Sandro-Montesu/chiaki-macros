@@ -15,7 +15,7 @@ echo
 # ── 1. System dependencies ──────────────────────────────────────────
 echo "[1/5] Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3-evdev tesseract-ocr
+sudo apt-get install -y -qq python3-evdev tesseract-ocr xvfb imagemagick
 
 # ── 2. uinput permissions (idempotent) ──────────────────────────────
 echo "[2/5] Setting up /dev/uinput permissions..."
@@ -43,19 +43,36 @@ fi
 echo "[3/5] Creating $BIN_DIR..."
 mkdir -p "$BIN_DIR"
 
-# ── 4. Symlink script ───────────────────────────────────────────────
-echo "[4/5] Linking chiaki-macro..."
+# ── 4. Symlink scripts ─────────────────────────────────────────────
+echo "[4/5] Linking scripts..."
+# chiaki-macro
 if [ -L "$SCRIPT_DST" ] || [ -f "$SCRIPT_DST" ]; then
     if [ "$(readlink -f "$SCRIPT_DST" 2>/dev/null)" = "$SCRIPT_SRC" ]; then
-        echo "  Symlink already correct."
+        echo "  chiaki-macro symlink already correct."
     else
         rm -f "$SCRIPT_DST"
         ln -s "$SCRIPT_SRC" "$SCRIPT_DST"
-        echo "  Symlink updated."
+        echo "  chiaki-macro symlink updated."
     fi
 else
     ln -s "$SCRIPT_SRC" "$SCRIPT_DST"
-    echo "  Symlink created."
+    echo "  chiaki-macro symlink created."
+fi
+
+# chiaki-gamepad-bridge
+BRIDGE_SRC="$SCRIPT_DIR/chiaki-gamepad-bridge"
+BRIDGE_DST="$BIN_DIR/chiaki-gamepad-bridge"
+if [ -L "$BRIDGE_DST" ] || [ -f "$BRIDGE_DST" ]; then
+    if [ "$(readlink -f "$BRIDGE_DST" 2>/dev/null)" = "$BRIDGE_SRC" ]; then
+        echo "  chiaki-gamepad-bridge symlink already correct."
+    else
+        rm -f "$BRIDGE_DST"
+        ln -s "$BRIDGE_SRC" "$BRIDGE_DST"
+        echo "  chiaki-gamepad-bridge symlink updated."
+    fi
+else
+    ln -s "$BRIDGE_SRC" "$BRIDGE_DST"
+    echo "  chiaki-gamepad-bridge symlink created."
 fi
 
 # ── 5. Add ~/.local/bin to PATH if missing ──────────────────────────
@@ -82,6 +99,12 @@ echo "chiaki-macro is ready to use:"
 echo "  chiaki-macro devices"
 echo "  chiaki-macro record my_macro"
 echo "  chiaki-macro play my_macro"
+echo
+echo "Headless mode (for automation / Raspberry Pi):"
+echo "  chiaki-macro headless-start <nickname> [host]"
+echo "  chiaki-macro headless-stop"
+echo "  chiaki-macro headless-status"
+echo "  chiaki-macro orchestrate config.toml -n -1"
 echo
 echo "Bash completion:"
 echo "  sudo cp chiaki-macro-completion.bash /etc/bash_completion.d/chiaki-macro"
