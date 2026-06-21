@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+"""
+chiaki-macro - Record and replay gamepad macros for Chiaki remote play.
+
+Raw passthrough recorder: captures every SYN_REPORT batch exactly as the
+controller sends it, including stick jitter (±1 oscillations). No deadzone,
+no filtering, no dedup. Replays with microsecond-precision busy-wait timing.
+
+Storage: ~/.config/chiaki-macro/macros.json
+"""
+
+import argparse
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from evdev import InputDevice, UInput, AbsInfo, ecodes, list_devices
+
+CONFIG_DIR = os.path.expanduser("~/.config/chiaki-macro")
+MACROS_FILE = os.path.join(CONFIG_DIR, "macros.json")
+
+K_TYPE = "t"
+K_CODE = "c"
+K_VALUE = "v"
+K_TS = "ts"
+K_EVENTS = "e"
+
+
+def capture_device_profile(dev):
+    caps = dev.capabilities()
+    abs_info = []
+    for code, ainfo in caps.get(ecodes.EV_ABS, []):
+        abs_info.append({
+            K_CODE: code, K_VALUE: ainfo.value,
+            "min": ainfo.min, "max": ainfo.max,
+            "flat": ainfo.flat, "fuzz": ainfo.fuzz,
+            "resolution": ainfo.resolution,
+        })
+    return {
+        "name": dev.name,
+        "vendor": dev.info.vendor,
+        "product": dev.info.product,
+        "version": dev.info.version,
+        "bustype": dev.info.bustype,
+        "ev_key": list(caps.get(ecodes.EV_KEY, [])),
+        "ev_abs": abs_info,
+        "ev_ff": list(caps.get(ecodes.EV_FF, [])),
+    }
+
+
+def build_uinput_caps(profile):
+    caps = {ecodes.EV_KEY: profile["ev_key"]}
+    abs_list = []
+    for a in profile["ev_abs"]:
+        abs_list.append((
+            a[K_CODE],
+            AbsInfo(a[K_VALUE], a["min"], a["max"], a["flat"], a["fuzz"], a["resolution"]),
+        ))
+    caps[ecodes.EV_ABS] = abs_list
+    return caps
+
+
+def find_controller(device_path=None):
+    if device_path:
+        try:
+            dev = InputDevice(device_path)
+            if ecodes.EV_KEY in dev.capabilities() and ecodes.EV_ABS in dev.capabilities():
+                return dev
+            print(f"WARNING: {device_path} is not a gamepad")
+            return None
+        except Exception as e:
+            print(f"ERROR: Cannot open {device_path}: {e}")
+            return None
+    controllers = []
+    for path in sorted(list_devices()):
+        try:
+            dev = InputDevice(path)
+            if ecodes.EV_KEY in dev.capabilities() and ecodes.EV_ABS in dev.capabilities():
+                controllers.append(dev)
+        except Exception:
+            pass
+    if not controllers:
+        return None
+    if len(controllers) > 1:
+        print("Multiple controllers found. Use --device to pick one:")
+        for c in controllers:
+            print(f"  {c.path:30s}  {c.name}")
+    return controllers[0]
+
+
+def load_macros():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    if not os.path.exists(MACROS_FILE):
+        return {"version": 5, "macros": {}}
+    with open(MACROS_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_macros(data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(MACROS_FILE, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+def record_macro(name, device_path=None, force_overwrite=False):
+    dev = find_controller(device_path)
+    if not dev:
+        print("ERROR: No controller found.")
+        sys.exit(1)
+
+    if not force_overwrite:
+        data = load_macros()
+        if name in data["macros"]:
+            if input(f"Macro '{name}' exists. Overwrite? [y/N] ").lower() not in ("y", "yes"):
+                print("Aborted.")
+                sys.exit(0)
+
+    profile = capture_device_profile(dev)
+    print(f"Recording from: {dev.name} ({dev.path})")
+    print(f"Macro: {name}")
+    print("Recording...  Press CTRL+C to stop.\n")
+
+    frames = []
+    pending_key = []     # KEY events in current batch
+    pending_abs = {}     # ABS events in current batch (last value per axis wins)
+    last_keys = {}       # across-batch dedup for KEY only
+    recording_start = None
+    running = [True]
+    syncing = True
+    total_changes = 0
+
+    def stop(sig, frame):
+        running[0] = False
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    try:
+        while running[0]:
+            r, _, _ = select.select([dev.fd], [], [], 0.005)
+            if not r:
+                continue
+            try:
+                batch = list(dev.read())
+            except Exception:
+                continue
+            for ev in batch:
+                if not running[0]:
+                    break
+
+                if syncing:
+                    if ev.type == ecodes.EV_SYN and ev.code == ecodes.SYN_REPORT:
+                        syncing = False
+                        recording_start = time.perf_counter()
+                        frame0 = []
+                        for a in profile["ev_abs"]:
+                            code = a[K_CODE]
+                            val = dev.absinfo(code).value
+                            frame0.append({K_TYPE: ecodes.EV_ABS, K_CODE: code, K_VALUE: val})
+                        for kc in dev.active_keys(verbose=True):
+                            kc = kc[0] if isinstance(kc, tuple) else kc
+                            if kc in profile["ev_key"]:
+                                last_keys[kc] = 1
+                                frame0.append({K_TYPE: ecodes.EV_KEY, K_CODE: kc, K_VALUE: 1})
+                        frames.append({K_TS: 0, K_EVENTS: frame0})
+                        total_changes += len(frame0)
+                    continue
+
+                if ev.type not in (ecodes.EV_KEY, ecodes.EV_ABS, ecodes.EV_SYN):
+                    continue
+
+                if ev.type == ecodes.EV_SYN:
+                    if ev.code == ecodes.SYN_DROPPED:
+                        print("  *** WARNING: events dropped ***")
+                        pending_key.clear()
+                        pending_abs.clear()
+                        last_keys.clear()
+                    elif ev.code == ecodes.SYN_REPORT:
+                        # Merge pending KEY + ABS into a batch
+                        batch_events = []
+                        for e in pending_key:
+                            batch_events.append(e)
+                            last_keys[e[K_CODE]] = e[K_VALUE]
+                        for code, val in pending_abs.items():
+                            batch_events.append({K_TYPE: ecodes.EV_ABS, K_CODE: code, K_VALUE: val})
+                        ts_us = int((time.perf_counter() - recording_start) * 1_000_000) if recording_start else 0
+                        frames.append({K_TS: ts_us, K_EVENTS: batch_events})
+                        total_changes += len(batch_events)
+                        pending_key.clear()
+                        pending_abs.clear()
+                    continue
+
+                if ev.type == ecodes.EV_KEY:
+                    # Only record if value changed from last sent
+                    if last_keys.get(ev.code) == ev.value:
+                        continue
+                    pending_key.append({K_TYPE: ecodes.EV_KEY, K_CODE: ev.code, K_VALUE: ev.value})
+
+                    label = ecodes.BTN.get(ev.code, ())
+                    if isinstance(label, tuple):
+                        label = label[-1] if label else f"c:{ev.code}"
+                    elif not label:
+                        label = ecodes.keys.get(ev.code, f"c:{ev.code}")
+                    st = {0: "REL", 1: "PRS", 2: "RPT"}.get(ev.value, "?")
+                    ms = int((time.perf_counter() - recording_start) * 1000) if recording_start else 0
+                    print(f"  {label:>20s}  {st}  ({ms}ms)")
+
+                elif ev.type == ecodes.EV_ABS:
+                    # Keep last value per axis within the batch
+                    pending_abs[ev.code] = ev.value
+
+    except Exception as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
+
+    if not frames:
+        print("\nNo frames recorded. Aborting.")
+        sys.exit(1)
+
+    duration_ms = frames[-1][K_TS] // 1000
+    print(f"\nFrames: {len(frames)}  |  Changes: {total_changes}  |  Duration: {duration_ms}ms")
+
+    data = load_macros()
+    data["macros"][name] = {
+        "created": datetime.now().isoformat(),
+        "device_profile": profile,
+        "duration_us": frames[-1][K_TS],
+        "frames": frames,
+    }
+    save_macros(data)
+    print(f"Saved: {name}  ->  {MACROS_FILE}")
+
+
+def take_screenshot_async(filepath):
+    """Launch screenshot in a background subprocess — never blocks."""
+    code = f'''
+import dbus, dbus.mainloop.glib, os, shutil
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+try:
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    portal = bus.get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+    iface = dbus.Interface(portal, "org.freedesktop.portal.Screenshot")
+    result = [None]
+    def cb(code, res):
+        result[0] = res.get("uri", "") if res else ""
+    reply = str(iface.Screenshot("", {{"handle_token": "chiaki_ss", "interactive": False}}))
+    bus.add_signal_receiver(cb, signal_name="Response",
+        dbus_interface="org.freedesktop.portal.Request",
+        bus_name="org.freedesktop.portal.Desktop", path=reply)
+    loop = GLib.MainLoop()
+    GLib.timeout_add(5000, loop.quit)
+    loop.run()
+    uri = result[0]
+    if uri and uri.startswith("file://"):
+        src = uri[7:]
+        if os.path.exists(src):
+            shutil.move(src, "{filepath}")
+except Exception:
+    pass
+'''
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def play_macro(name, loops=1, screenshot_at=None, screenshot_dir=None):
+    data = load_macros()
+    if name not in data["macros"]:
+        print(f"ERROR: Macro '{name}' not found.")
+        sys.exit(1)
+
+    macro = data["macros"][name]
+    frames = macro["frames"]
+    profile = macro.get("device_profile", {})
+    if not profile:
+        print("ERROR: Macro has no device profile. Please re-record.")
+        sys.exit(1)
+
+    # Duration
+    last = frames[-1]
+    duration_us = macro.get("duration_us", last.get(K_TS, last.get("ts", 0) * 1000))
+    duration_ms = duration_us // 1000
+
+    print(f"Macro:     {name}")
+    print(f"Created:   {macro.get('created', '?')}")
+    print(f"Frames:    {len(frames)}")
+    print(f"Duration:  {duration_ms}ms ({duration_ms/1000:.1f}s)")
+    print(f"Device:    {profile.get('name', '?')}")
+    print()
+
+    if loops == 0:
+        print("Loops=0, exiting.")
+        return
+
+    vpad_name = f"Chiaki Replay [{profile.get('name', 'gamepad')}]"
+    uinput_caps = build_uinput_caps(profile)
+
+    vpad = None
+    try:
+        vpad = UInput(
+            events=uinput_caps, name=vpad_name,
+            vendor=profile["vendor"], product=profile["product"],
+            version=profile["version"], bustype=profile["bustype"],
+        )
+    except (PermissionError, OSError):
+        print("ERROR: Cannot write to /dev/uinput. Run with sudo:")
+        print("  sudo -E chiaki-macro play " + name)
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR creating virtual gamepad: {e}")
+        sys.exit(1)
+
+    iteration = 0
+    infinite = loops < 0
+    total = loops if not infinite else None
+    interrupted = False
+
+    try:
+        print(f"Virtual gamepad: {vpad.device.path}")
+        print(f"  {vpad_name}")
+        print(f"  Vendor: 0x{profile['vendor']:04x}  Product: 0x{profile['product']:04x}")
+        print(f"  Loops: {'infinite' if infinite else total}")
+        print()
+
+        vpad.syn()
+
+        # Screenshot setup
+        ss_at_us = None
+        ss_dir = None
+        if screenshot_at is not None:
+            ss_at_us = int(screenshot_at * 1_000_000)
+            ss_dir = screenshot_dir or os.path.expanduser("~/chiaki-screenshots")
+            os.makedirs(ss_dir, exist_ok=True)
+
+        print("Waiting 2 seconds for Chiaki to detect...")
+        wstart = time.perf_counter()
+        while time.perf_counter() - wstart < 2:
+            vpad.syn()
+            time.sleep(0.1)
+
+        while infinite or iteration < total:
+            iteration += 1
+            if total and total > 1:
+                print(f"--- Loop {iteration}/{total} ---")
+
+            replay_start = time.perf_counter()
+            last_ts = 0
+            ss_taken = False
+
+            for i, frame in enumerate(frames):
+                ts = frame.get(K_TS, frame.get("ts", 0) * 1000)
+                if ts > last_ts:
+                    target = replay_start + (ts / 1_000_000.0)
+                    while time.perf_counter() < target:
+                        time.sleep(0.0001)
+
+                for ev_key in (K_EVENTS, "events"):
+                    if ev_key in frame:
+                        for ev in frame[ev_key]:
+                            vpad.write(ev[K_TYPE], ev[K_CODE], ev[K_VALUE])
+                        break
+                vpad.syn()
+                last_ts = ts
+
+                if ss_at_us is not None and not ss_taken and ts >= ss_at_us:
+                    ss_taken = True
+                    ss_path = os.path.join(ss_dir, f"{name}_loop{iteration}_{screenshot_at:.1f}s.png")
+                    take_screenshot_async(ss_path)
+                    print(f"\n  [screenshot: {ss_path}]")
+
+                if i % 500 == 0 or i == len(frames) - 1:
+                    elapsed = time.perf_counter() - replay_start
+                    loop_str = f"loop {iteration}" if (infinite or (total and total > 1)) else ""
+                    print(f"\r  frame {i+1}/{len(frames)}  {ts//1000}/{duration_ms}ms  ({elapsed:.1f}s)  {loop_str}", end="", flush=True)
+
+            elapsed = time.perf_counter() - replay_start
+            print(f"\r  frame {len(frames)}/{len(frames)}  {duration_ms}/{duration_ms}ms  ({elapsed:.1f}s)")
+
+        print("\nReplay complete.")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nReplay interrupted.")
+    finally:
+        try:
+            vpad.close()
+        except Exception:
+            pass
+        if interrupted:
+            print("Virtual gamepad removed.")
+
+
+def list_macros():
+    data = load_macros()
+    macros = data["macros"]
+    if not macros:
+        print("No macros saved.")
+        return
+    print(f"Saved macros ({len(macros)}):\n")
+    for n, m in macros.items():
+        profile = m.get("device_profile", {})
+        dur = m.get("duration_us", 0)
+        frames = m.get("frames", [])
+        changes = sum(len(f.get(K_EVENTS, f.get("events", []))) for f in frames)
+        print(f"  {n}")
+        print(f"    Source:   {profile.get('name', '?')}")
+        print(f"    Duration: {dur//1000}ms ({dur/1000000:.1f}s)")
+        print(f"    Frames:   {len(frames)}  Changes: {changes}")
+        print(f"    Created:  {m.get('created', '?')}")
+        print()
+
+
+def delete_macro(name):
+    data = load_macros()
+    if name not in data["macros"]:
+        print(f"ERROR: Macro '{name}' not found.")
+        sys.exit(1)
+    del data["macros"][name]
+    save_macros(data)
+    print(f"Deleted: {name}")
+
+
+def cmd_devices():
+    print("Input devices:\n")
+    for path in sorted(list_devices()):
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities()
+            tag = "[GAMEPAD]" if (ecodes.EV_KEY in caps and ecodes.EV_ABS in caps) else ""
+            print(f"  {dev.path:30s}  {dev.name:40s}  {tag}")
+        except Exception:
+            pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Record and replay gamepad macros for Chiaki")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("list", help="List saved macros")
+    sub.add_parser("devices", help="List input devices")
+    p = sub.add_parser("record", help="Record macro from gamepad")
+    p.add_argument("name", help="Macro name")
+    p.add_argument("--device", "-d", help="Path to input device")
+    p.add_argument("-y", "--yes", action="store_true", help="Overwrite without asking")
+    p = sub.add_parser("play", help="Replay macro via virtual gamepad")
+    p.add_argument("name", help="Macro name")
+    p.add_argument("-n", "--loops", type=int, default=1, help="Replays: -1=infinite, 0=skip, N=times")
+    p.add_argument("--screenshot-at", type=float, help="Take screenshot at this second (e.g. 23.5)")
+    p.add_argument("--screenshot-dir", help="Directory for screenshots (default: ~/chiaki-screenshots)")
+    p = sub.add_parser("delete", help="Delete a macro")
+    p.add_argument("name", help="Macro name")
+    args = parser.parse_args()
+
+    cmds = {
+        "list": list_macros,
+        "devices": cmd_devices,
+        "record": lambda: record_macro(args.name, getattr(args, "device", None), getattr(args, "yes", False)),
+        "play": lambda: play_macro(
+            args.name,
+            getattr(args, "loops", 1),
+            getattr(args, "screenshot_at", None),
+            getattr(args, "screenshot_dir", None),
+        ),
+        "delete": lambda: delete_macro(args.name),
+    }
+    cmds[args.command]()
+
+
+if __name__ == "__main__":
+    main()
