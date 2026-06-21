@@ -1,0 +1,19 @@
+# chiaki-macro orchestration config
+
+[main]
+macro = "test2"
+
+[ocr]
+enabled_at_s = 14.3
+region = "1033,56,18,18"
+whitelist = "0123456789"
+
+[[task]]
+name = "Buy Karma Cicatrici"
+level_req = 3
+macro = "buy_skill_cicatrici"
+execute_time = "after_current_macro"
+completed = false
+
+
+
