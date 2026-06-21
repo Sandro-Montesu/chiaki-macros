@@ -3,8 +3,8 @@
 chiaki-macro - Record and replay gamepad macros for Chiaki remote play.
 
 Raw passthrough recorder: captures every SYN_REPORT batch exactly as the
-controller sends it, including stick jitter (±1 oscillations). No deadzone,
-no filtering, no dedup. Replays with microsecond-precision busy-wait timing.
+controller sends it, including stick jitter. Replays with microsecond
+busy-wait timing.  Supports orchestration with OCR-based conditional tasks.
 
 Storage: ~/.config/chiaki-macro/macros.json
 """
@@ -12,6 +12,7 @@ Storage: ~/.config/chiaki-macro/macros.json
 import argparse
 import json
 import os
+import re
 import select
 import signal
 import subprocess
@@ -29,6 +30,8 @@ K_VALUE = "v"
 K_TS = "ts"
 K_EVENTS = "e"
 
+
+# ── Device profile ──────────────────────────────────────────────────
 
 def capture_device_profile(dev):
     caps = dev.capabilities()
@@ -58,11 +61,434 @@ def build_uinput_caps(profile):
     for a in profile["ev_abs"]:
         abs_list.append((
             a[K_CODE],
-            AbsInfo(a[K_VALUE], a["min"], a["max"], a["flat"], a["fuzz"], a["resolution"]),
+            AbsInfo(a[K_VALUE], a["min"], a["max"],
+                    a["flat"], a["fuzz"], a["resolution"]),
         ))
     caps[ecodes.EV_ABS] = abs_list
     return caps
 
+
+def load_macro_data(name):
+    data = load_macros()
+    if name not in data["macros"]:
+        print(f"ERROR: Macro '{name}' not found.")
+        sys.exit(1)
+    m = data["macros"][name]
+    profile = m.get("device_profile", {})
+    if not profile:
+        print("ERROR: Macro has no device profile. Please re-record.")
+        sys.exit(1)
+    frames = m["frames"]
+    last = frames[-1]
+    duration_us = m.get("duration_us", last.get(K_TS, last.get("ts", 0) * 1000))
+    return profile, frames, duration_us
+
+
+# ── UInput helpers ──────────────────────────────────────────────────
+
+def _create_vpad(profile):
+    vname = f"Chiaki Replay [{profile.get('name', 'gamepad')}]"
+    try:
+        return UInput(
+            events=build_uinput_caps(profile), name=vname,
+            vendor=profile["vendor"], product=profile["product"],
+            version=profile["version"], bustype=profile["bustype"],
+        )
+    except (PermissionError, OSError):
+        print("ERROR: Cannot write to /dev/uinput. Run with sudo.")
+        sys.exit(1)
+
+
+def _wait_detect(vpad):
+    print("Waiting 2 seconds for Chiaki to detect...")
+    wstart = time.perf_counter()
+    while time.perf_counter() - wstart < 2:
+        vpad.syn()
+        time.sleep(0.1)
+
+
+# ── Single-loop replay (shared) ─────────────────────────────────────
+
+def _replay_one_loop(vpad, frames, duration_us, *,
+                      screenshot_at_us=None, on_screenshot=None):
+    """Replay one loop of a macro. Calls on_screenshot(path) at the right time.
+    Returns the screenshot path if taken, else None."""
+    duration_ms = duration_us // 1000
+    replay_start = time.perf_counter()
+    last_ts = 0
+    ss_taken = False
+    ss_path = None
+
+    for i, frame in enumerate(frames):
+        ts = frame.get(K_TS, frame.get("ts", 0) * 1000)
+        if ts > last_ts:
+            target = replay_start + (ts / 1_000_000.0)
+            while time.perf_counter() < target:
+                time.sleep(0.0001)
+
+        for ek in (K_EVENTS, "events"):
+            if ek in frame:
+                for ev in frame[ek]:
+                    vpad.write(ev[K_TYPE], ev[K_CODE], ev[K_VALUE])
+                break
+        vpad.syn()
+        last_ts = ts
+
+        if screenshot_at_us and not ss_taken and ts >= screenshot_at_us:
+            ss_taken = True
+            if on_screenshot:
+                ss_path = on_screenshot()
+
+        if i % 500 == 0 or i == len(frames) - 1:
+            elapsed = time.perf_counter() - replay_start
+            print(f"\r  frame {i+1}/{len(frames)}  {ts//1000}/{duration_ms}ms  ({elapsed:.1f}s)", end="", flush=True)
+
+    elapsed = time.perf_counter() - replay_start
+    print(f"\r  frame {len(frames)}/{len(frames)}  {duration_ms}/{duration_ms}ms  ({elapsed:.1f}s)")
+    return ss_path
+
+
+# ── Screenshot / OCR ────────────────────────────────────────────────
+
+def _screenshot_sync(filepath):
+    """Take a screenshot synchronously (blocks until done)."""
+    code = f'''
+import dbus, dbus.mainloop.glib, os, shutil
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+portal = bus.get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+iface = dbus.Interface(portal, "org.freedesktop.portal.Screenshot")
+r = [None]
+def cb(c, res):
+    r[0] = res.get("uri", "") if res else ""
+reply = str(iface.Screenshot("", {{"handle_token": "chiaki_ss", "interactive": False}}))
+bus.add_signal_receiver(cb, signal_name="Response",
+    dbus_interface="org.freedesktop.portal.Request",
+    bus_name="org.freedesktop.portal.Desktop", path=reply)
+loop = GLib.MainLoop()
+GLib.timeout_add(5000, loop.quit)
+loop.run()
+uri = r[0]
+if uri and uri.startswith("file://"):
+    src = uri[7:]
+    if os.path.exists(src):
+        shutil.move(src, "{filepath}")
+'''
+    try:
+        subprocess.run([sys.executable, "-c", code], timeout=8,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return os.path.exists(filepath)
+    except Exception:
+        return False
+
+
+def _ocr_read_number(image_path, whitelist="0123456789"):
+    """Run tesseract OCR on an image, return parsed integer or None."""
+    try:
+        r = subprocess.run(
+            ["tesseract", image_path, "stdout",
+             "--psm", "7",
+             "-c", f"tessedit_char_whitelist={whitelist}"],
+            capture_output=True, text=True, timeout=8,
+        )
+        text = r.stdout.strip()
+        match = re.search(r'\d+', text)
+        return int(match.group()) if match else None
+    except Exception:
+        return None
+
+
+def _crop_image(src, dst, region):
+    """Crop an image using Pillow. region = (x, y, w, h)."""
+    try:
+        from PIL import Image
+        img = Image.open(src)
+        x, y, w, h = region
+        cropped = img.crop((x, y, x + w, y + h))
+        cropped.save(dst)
+        return True
+    except Exception:
+        return False
+
+
+def parse_region(s):
+    """Parse "x,y,w,h" into (int, int, int, int)."""
+    parts = s.replace(",", " ").split()
+    if len(parts) != 4:
+        raise ValueError(f"Region must be 'x,y,w,h', got: {s}")
+    return tuple(int(p) for p in parts)
+
+
+# ── play_macro (refactored) ─────────────────────────────────────────
+
+def play_macro(name, loops=1, screenshot_at=None, screenshot_dir=None):
+    try:
+        profile, frames, duration_us = load_macro_data(name)
+    except SystemExit:
+        return
+
+    duration_ms = duration_us // 1000
+    print(f"Macro:     {name}")
+    print(f"Frames:    {len(frames)}")
+    print(f"Duration:  {duration_ms}ms ({duration_ms/1000:.1f}s)")
+    print(f"Device:    {profile.get('name', '?')}\n")
+
+    if loops == 0:
+        print("Loops=0, exiting.")
+        return
+
+    ss_at_us = int(screenshot_at * 1_000_000) if screenshot_at else None
+    ss_dir = screenshot_dir or os.path.expanduser("~/chiaki-screenshots")
+    if ss_at_us:
+        os.makedirs(ss_dir, exist_ok=True)
+
+    vpad = _create_vpad(profile)
+    iteration = 0
+    infinite = loops < 0
+    total = loops if not infinite else None
+    interrupted = False
+
+    try:
+        print(f"Virtual gamepad: {vpad.device.path}")
+        print(f"  Vendor: 0x{profile['vendor']:04x}  Product: 0x{profile['product']:04x}")
+        print(f"  Loops: {'infinite' if infinite else total}\n")
+        vpad.syn()
+        _wait_detect(vpad)
+
+        while infinite or iteration < total:
+            iteration += 1
+            if total and total > 1:
+                print(f"--- Loop {iteration}/{total} ---")
+
+            def take_ss():
+                path = os.path.join(ss_dir, f"{name}_loop{iteration}_{screenshot_at:.1f}s.png")
+                _screenshot_sync(path)
+                return path
+
+            result = _replay_one_loop(vpad, frames, duration_us,
+                                       screenshot_at_us=ss_at_us,
+                                       on_screenshot=take_ss if ss_at_us else None)
+            if result:
+                print(f"  [screenshot: {result}]")
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nReplay interrupted.")
+    finally:
+        try:
+            vpad.close()
+        except Exception:
+            pass
+        if interrupted:
+            print("Virtual gamepad removed.")
+
+
+# ── orchestrate ─────────────────────────────────────────────────────
+
+def _parse_toml(path):
+    """Parse a TOML config file. Returns dict or exits."""
+    try:
+        import tomllib
+    except ImportError:
+        print("ERROR: Python 3.11+ required for TOML support.")
+        sys.exit(1)
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception as e:
+        print(f"ERROR reading {path}: {e}")
+        sys.exit(1)
+
+
+def _save_toml(path, config):
+    """Write a TOML config back. Preserves comments via manual write."""
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception:
+        lines = []
+
+    out = []
+    in_task = False
+    task_idx = 0
+    task_i = 0
+    for line in lines:
+        s = line.rstrip()
+        if s.startswith("[[task]]"):
+            in_task = True
+            task_i = task_idx
+            task_idx += 1
+            out.append(line.rstrip("\n"))
+        elif s.startswith("completed ="):
+            if in_task and task_i < len(config.get("task", [])):
+                val = str(config["task"][task_i].get("completed", False)).lower()
+                out.append(f"completed = {val}\n")
+                in_task = False
+            else:
+                out.append(line.rstrip("\n"))
+        else:
+            out.append(line.rstrip("\n"))
+
+    with open(path, "w") as f:
+        f.write("\n".join(out) + "\n")
+
+
+def orchestrate(config_path, loops):
+    config = _parse_toml(config_path)
+    main_cfg = config.get("main", {})
+    main_name = main_cfg.get("macro")
+    if not main_name:
+        print("ERROR: [main] must have 'macro' key.")
+        sys.exit(1)
+
+    ocr_cfg = config.get("ocr", {})
+    ss_at_s = ocr_cfg.get("enabled_at_s")
+    region_str = ocr_cfg.get("region", "")
+    whitelist = ocr_cfg.get("whitelist", "0123456789")
+    ocr_dir = os.path.expanduser("~/chiaki-orchestrate")
+    os.makedirs(ocr_dir, exist_ok=True)
+
+    tasks = config.get("task", [])
+    # Build pending list, tracking original index
+    pending_tasks = []
+    for idx, t in enumerate(tasks):
+        if not t.get("completed", False):
+            pending_tasks.append((idx, t))
+
+    # Load main macro once
+    try:
+        profile, frames, duration_us = load_macro_data(main_name)
+    except SystemExit:
+        return
+
+    duration_ms = duration_us // 1000
+    ss_at_us = int(ss_at_s * 1_000_000) if ss_at_s else None
+    region = parse_region(region_str) if region_str else None
+
+    # Pre-load task macros
+    task_macros = {}
+    for idx, t in pending_tasks:
+        try:
+            tp, tf, td = load_macro_data(t["macro"])
+            task_macros[t["name"]] = (tp, tf, td)
+        except SystemExit:
+            print(f"WARNING: Task '{t['name']}' macro '{t['macro']}' not found, skipping.")
+            tasks[idx]["completed"] = True
+
+    pending_tasks = [(idx, t) for idx, t in pending_tasks if t["name"] in task_macros]
+
+    print(f"Orchestrator: {config_path}")
+    print(f"  Main macro: {main_name}  ({duration_ms//1000:.1f}s)")
+    if ss_at_us:
+        print(f"  OCR at {ss_at_s}s  region={region_str}")
+    if pending_tasks:
+        print(f"  Pending tasks: {len(pending_tasks)}")
+        for idx, t in pending_tasks:
+            print(f"    {t['name']}  (level_req={t.get('level_req', '?')}, macro={t['macro']})")
+    print()
+
+    if loops == 0:
+        print("Loops=0, exiting.")
+        return
+
+    vpad = _create_vpad(profile)
+    iteration = 0
+    infinite = loops < 0
+    total = loops if not infinite else None
+    interrupted = False
+
+    try:
+        print(f"Virtual gamepad: {vpad.device.path}")
+        print(f"  Vendor: 0x{profile['vendor']:04x}  Product: 0x{profile['product']:04x}")
+        print(f"  Loops: {'infinite' if infinite else total}\n")
+        vpad.syn()
+        _wait_detect(vpad)
+
+        while infinite or iteration < total:
+            iteration += 1
+            print(f"--- Loop {iteration}" + (f"/{total}" if total else "") + " ---")
+
+            # Play main macro
+            ss_path_ref = [None]
+
+            def on_ss():
+                path = os.path.join(ocr_dir, f"_ocr_loop{iteration}.png")
+                if _screenshot_sync(path):
+                    ss_path_ref[0] = path
+                return path
+
+            result = _replay_one_loop(vpad, frames, duration_us,
+                                       screenshot_at_us=ss_at_us,
+                                       on_screenshot=on_ss if ss_at_us else None)
+
+            # OCR check
+            if ss_path_ref[0] and region:
+                ss_file = ss_path_ref[0]
+                crop_file = ss_file.replace(".png", "_crop.png")
+                if _crop_image(ss_file, crop_file, region):
+                    level = _ocr_read_number(crop_file, whitelist)
+                    print(f"  [OCR] level: {level if level is not None else 'N/A'}")
+                    if level is not None and pending_tasks:
+                        for ti, (orig_idx, t) in enumerate(pending_tasks):
+                            req = t.get("level_req", 999)
+                            if level >= req and t["name"] in task_macros:
+                                et = t.get("execute_time", "after_current_macro")
+                                if et == "after_current_macro":
+                                    tp, tf, td = task_macros[t["name"]]
+                                    print(f"  [TASK] {t['name']} (req {req}) → playing {t['macro']}...")
+                                    _replay_one_loop(vpad, tf, td)
+                                    t["completed"] = True
+                                    tasks[orig_idx]["completed"] = True
+                                    _save_toml(config_path, config)
+                                    print(f"  [TASK] completed, config saved.")
+                                break  # one task per loop
+
+            # Remove completed tasks from pending list
+            pending_tasks = [(idx, t) for idx, t in pending_tasks if not t.get("completed", False)]
+
+            if not pending_tasks and infinite:
+                print("  All tasks completed. Continuing main loop...")
+
+        print("\nOrchestration complete.")
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nOrchestration interrupted.")
+    finally:
+        try:
+            vpad.close()
+        except Exception:
+            pass
+        if interrupted:
+            print("Virtual gamepad removed.")
+
+
+# ── ocr-test ────────────────────────────────────────────────────────
+
+def cmd_ocr_test(region_str):
+    region = parse_region(region_str)
+    ss_path = "/tmp/chiaki-ocr-test.png"
+    crop_path = "/tmp/chiaki-ocr-test-crop.png"
+
+    print(f"Taking screenshot...")
+    if not _screenshot_sync(ss_path):
+        print("ERROR: Screenshot failed.")
+        sys.exit(1)
+    print(f"Full screenshot: {ss_path}")
+
+    if not _crop_image(ss_path, crop_path, region):
+        print("ERROR: Crop failed (install Pillow: pip install Pillow).")
+        sys.exit(1)
+    print(f"Cropped region:  {crop_path}")
+
+    number = _ocr_read_number(crop_path)
+    print(f"OCR result:      {number if number is not None else 'N/A (no digits found)'}")
+    if number is not None:
+        print(f"Parsed integer:  {number}")
+
+
+# ── record_macro ────────────────────────────────────────────────────
 
 def find_controller(device_path=None):
     if device_path:
@@ -125,9 +551,9 @@ def record_macro(name, device_path=None, force_overwrite=False):
     print("Recording...  Press CTRL+C to stop.\n")
 
     frames = []
-    pending_key = []     # KEY events in current batch
-    pending_abs = {}     # ABS events in current batch (last value per axis wins)
-    last_keys = {}       # across-batch dedup for KEY only
+    pending_key = []
+    pending_abs = {}
+    last_keys = {}
     recording_start = None
     running = [True]
     syncing = True
@@ -150,7 +576,6 @@ def record_macro(name, device_path=None, force_overwrite=False):
             for ev in batch:
                 if not running[0]:
                     break
-
                 if syncing:
                     if ev.type == ecodes.EV_SYN and ev.code == ecodes.SYN_REPORT:
                         syncing = False
@@ -168,10 +593,8 @@ def record_macro(name, device_path=None, force_overwrite=False):
                         frames.append({K_TS: 0, K_EVENTS: frame0})
                         total_changes += len(frame0)
                     continue
-
                 if ev.type not in (ecodes.EV_KEY, ecodes.EV_ABS, ecodes.EV_SYN):
                     continue
-
                 if ev.type == ecodes.EV_SYN:
                     if ev.code == ecodes.SYN_DROPPED:
                         print("  *** WARNING: events dropped ***")
@@ -179,7 +602,6 @@ def record_macro(name, device_path=None, force_overwrite=False):
                         pending_abs.clear()
                         last_keys.clear()
                     elif ev.code == ecodes.SYN_REPORT:
-                        # Merge pending KEY + ABS into a batch
                         batch_events = []
                         for e in pending_key:
                             batch_events.append(e)
@@ -192,13 +614,10 @@ def record_macro(name, device_path=None, force_overwrite=False):
                         pending_key.clear()
                         pending_abs.clear()
                     continue
-
                 if ev.type == ecodes.EV_KEY:
-                    # Only record if value changed from last sent
                     if last_keys.get(ev.code) == ev.value:
                         continue
                     pending_key.append({K_TYPE: ecodes.EV_KEY, K_CODE: ev.code, K_VALUE: ev.value})
-
                     label = ecodes.BTN.get(ev.code, ())
                     if isinstance(label, tuple):
                         label = label[-1] if label else f"c:{ev.code}"
@@ -207,11 +626,8 @@ def record_macro(name, device_path=None, force_overwrite=False):
                     st = {0: "REL", 1: "PRS", 2: "RPT"}.get(ev.value, "?")
                     ms = int((time.perf_counter() - recording_start) * 1000) if recording_start else 0
                     print(f"  {label:>20s}  {st}  ({ms}ms)")
-
                 elif ev.type == ecodes.EV_ABS:
-                    # Keep last value per axis within the batch
                     pending_abs[ev.code] = ev.value
-
     except Exception as e:
         print(f"\nError: {e}")
         sys.exit(1)
@@ -234,169 +650,7 @@ def record_macro(name, device_path=None, force_overwrite=False):
     print(f"Saved: {name}  ->  {MACROS_FILE}")
 
 
-def take_screenshot_async(filepath):
-    """Launch screenshot in a background subprocess — never blocks."""
-    code = f'''
-import dbus, dbus.mainloop.glib, os, shutil
-from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
-try:
-    DBusGMainLoop(set_as_default=True)
-    bus = dbus.SessionBus()
-    portal = bus.get_object("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
-    iface = dbus.Interface(portal, "org.freedesktop.portal.Screenshot")
-    result = [None]
-    def cb(code, res):
-        result[0] = res.get("uri", "") if res else ""
-    reply = str(iface.Screenshot("", {{"handle_token": "chiaki_ss", "interactive": False}}))
-    bus.add_signal_receiver(cb, signal_name="Response",
-        dbus_interface="org.freedesktop.portal.Request",
-        bus_name="org.freedesktop.portal.Desktop", path=reply)
-    loop = GLib.MainLoop()
-    GLib.timeout_add(5000, loop.quit)
-    loop.run()
-    uri = result[0]
-    if uri and uri.startswith("file://"):
-        src = uri[7:]
-        if os.path.exists(src):
-            shutil.move(src, "{filepath}")
-except Exception:
-    pass
-'''
-    try:
-        subprocess.Popen(
-            [sys.executable, "-c", code],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
-
-def play_macro(name, loops=1, screenshot_at=None, screenshot_dir=None):
-    data = load_macros()
-    if name not in data["macros"]:
-        print(f"ERROR: Macro '{name}' not found.")
-        sys.exit(1)
-
-    macro = data["macros"][name]
-    frames = macro["frames"]
-    profile = macro.get("device_profile", {})
-    if not profile:
-        print("ERROR: Macro has no device profile. Please re-record.")
-        sys.exit(1)
-
-    # Duration
-    last = frames[-1]
-    duration_us = macro.get("duration_us", last.get(K_TS, last.get("ts", 0) * 1000))
-    duration_ms = duration_us // 1000
-
-    print(f"Macro:     {name}")
-    print(f"Created:   {macro.get('created', '?')}")
-    print(f"Frames:    {len(frames)}")
-    print(f"Duration:  {duration_ms}ms ({duration_ms/1000:.1f}s)")
-    print(f"Device:    {profile.get('name', '?')}")
-    print()
-
-    if loops == 0:
-        print("Loops=0, exiting.")
-        return
-
-    vpad_name = f"Chiaki Replay [{profile.get('name', 'gamepad')}]"
-    uinput_caps = build_uinput_caps(profile)
-
-    vpad = None
-    try:
-        vpad = UInput(
-            events=uinput_caps, name=vpad_name,
-            vendor=profile["vendor"], product=profile["product"],
-            version=profile["version"], bustype=profile["bustype"],
-        )
-    except (PermissionError, OSError):
-        print("ERROR: Cannot write to /dev/uinput. Run with sudo:")
-        print("  sudo -E chiaki-macro play " + name)
-        sys.exit(1)
-    except Exception as e:
-        print(f"ERROR creating virtual gamepad: {e}")
-        sys.exit(1)
-
-    iteration = 0
-    infinite = loops < 0
-    total = loops if not infinite else None
-    interrupted = False
-
-    try:
-        print(f"Virtual gamepad: {vpad.device.path}")
-        print(f"  {vpad_name}")
-        print(f"  Vendor: 0x{profile['vendor']:04x}  Product: 0x{profile['product']:04x}")
-        print(f"  Loops: {'infinite' if infinite else total}")
-        print()
-
-        vpad.syn()
-
-        # Screenshot setup
-        ss_at_us = None
-        ss_dir = None
-        if screenshot_at is not None:
-            ss_at_us = int(screenshot_at * 1_000_000)
-            ss_dir = screenshot_dir or os.path.expanduser("~/chiaki-screenshots")
-            os.makedirs(ss_dir, exist_ok=True)
-
-        print("Waiting 2 seconds for Chiaki to detect...")
-        wstart = time.perf_counter()
-        while time.perf_counter() - wstart < 2:
-            vpad.syn()
-            time.sleep(0.1)
-
-        while infinite or iteration < total:
-            iteration += 1
-            if total and total > 1:
-                print(f"--- Loop {iteration}/{total} ---")
-
-            replay_start = time.perf_counter()
-            last_ts = 0
-            ss_taken = False
-
-            for i, frame in enumerate(frames):
-                ts = frame.get(K_TS, frame.get("ts", 0) * 1000)
-                if ts > last_ts:
-                    target = replay_start + (ts / 1_000_000.0)
-                    while time.perf_counter() < target:
-                        time.sleep(0.0001)
-
-                for ev_key in (K_EVENTS, "events"):
-                    if ev_key in frame:
-                        for ev in frame[ev_key]:
-                            vpad.write(ev[K_TYPE], ev[K_CODE], ev[K_VALUE])
-                        break
-                vpad.syn()
-                last_ts = ts
-
-                if ss_at_us is not None and not ss_taken and ts >= ss_at_us:
-                    ss_taken = True
-                    ss_path = os.path.join(ss_dir, f"{name}_loop{iteration}_{screenshot_at:.1f}s.png")
-                    take_screenshot_async(ss_path)
-                    print(f"\n  [screenshot: {ss_path}]")
-
-                if i % 500 == 0 or i == len(frames) - 1:
-                    elapsed = time.perf_counter() - replay_start
-                    loop_str = f"loop {iteration}" if (infinite or (total and total > 1)) else ""
-                    print(f"\r  frame {i+1}/{len(frames)}  {ts//1000}/{duration_ms}ms  ({elapsed:.1f}s)  {loop_str}", end="", flush=True)
-
-            elapsed = time.perf_counter() - replay_start
-            print(f"\r  frame {len(frames)}/{len(frames)}  {duration_ms}/{duration_ms}ms  ({elapsed:.1f}s)")
-
-        print("\nReplay complete.")
-    except KeyboardInterrupt:
-        interrupted = True
-        print("\nReplay interrupted.")
-    finally:
-        try:
-            vpad.close()
-        except Exception:
-            pass
-        if interrupted:
-            print("Virtual gamepad removed.")
-
+# ── CLI commands ────────────────────────────────────────────────────
 
 def list_macros():
     data = load_macros()
@@ -429,7 +683,6 @@ def delete_macro(name):
 
 
 def import_macros(path, force=False):
-    """Merge macros from an external JSON file into the current config."""
     if not os.path.exists(path):
         print(f"ERROR: File not found: {path}")
         sys.exit(1)
@@ -439,21 +692,16 @@ def import_macros(path, force=False):
     except Exception as e:
         print(f"ERROR: Cannot read {path}: {e}")
         sys.exit(1)
-
     src_macros = src.get("macros", {})
     if not src_macros:
         print("No macros found in file.")
         return
-
     data = load_macros()
     current = data.get("macros", {})
     imported = 0
     skipped = 0
-
     print(f"Importing from: {path}")
-    print(f"Source macros:  {len(src_macros)}")
-    print()
-
+    print(f"Source macros:  {len(src_macros)}\n")
     for name, macro in sorted(src_macros.items()):
         if name in current:
             if force:
@@ -476,12 +724,9 @@ def import_macros(path, force=False):
             current[name] = macro
             imported += 1
             print(f"  {name}  ->  imported")
-
     data["macros"] = current
     save_macros(data)
-
-    print()
-    print(f"Done: {imported} imported, {skipped} skipped")
+    print(f"\nDone: {imported} imported, {skipped} skipped")
     print(f"Config: {MACROS_FILE}")
 
 
@@ -497,39 +742,61 @@ def cmd_devices():
             pass
 
 
+# ── main ────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser(description="Record and replay gamepad macros for Chiaki")
     sub = parser.add_subparsers(dest="command", required=True)
+
     sub.add_parser("list", help="List saved macros")
     sub.add_parser("devices", help="List input devices")
+
     p = sub.add_parser("record", help="Record macro from gamepad")
     p.add_argument("name", help="Macro name")
     p.add_argument("--device", "-d", help="Path to input device")
     p.add_argument("-y", "--yes", action="store_true", help="Overwrite without asking")
+
     p = sub.add_parser("play", help="Replay macro via virtual gamepad")
     p.add_argument("name", help="Macro name")
-    p.add_argument("-n", "--loops", type=int, default=1, help="Replays: -1=infinite, 0=skip, N=times")
-    p.add_argument("--screenshot-at", type=float, help="Take screenshot at this second (e.g. 23.5)")
-    p.add_argument("--screenshot-dir", help="Directory for screenshots (default: ~/chiaki-screenshots)")
+    p.add_argument("-n", "--loops", type=int, default=1,
+                   help="Replays: -1=infinite, 0=skip, N=times")
+    p.add_argument("--screenshot-at", type=float,
+                   help="Take screenshot at this second (e.g. 23.5)")
+    p.add_argument("--screenshot-dir",
+                   help="Directory for screenshots (default: ~/chiaki-screenshots)")
+
     p = sub.add_parser("delete", help="Delete a macro")
     p.add_argument("name", help="Macro name")
+
     p = sub.add_parser("import", help="Import macros from another config file")
     p.add_argument("path", help="Path to macros.json file")
-    p.add_argument("-y", "--yes", action="store_true", help="Overwrite all existing macros without asking")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="Overwrite all existing macros without asking")
+
+    p = sub.add_parser("orchestrate", help="Run main macro with OCR-based task system")
+    p.add_argument("config", help="Path to TOML config file")
+    p.add_argument("-n", "--loops", type=int, default=1,
+                   help="Number of main macro loops (-1=infinite)")
+
+    p = sub.add_parser("ocr-test", help="Test OCR on a screenshot region")
+    p.add_argument("--region", required=True,
+                   help="Region to OCR, e.g. '800,50,200,40' (x,y,w,h)")
+
     args = parser.parse_args()
 
     cmds = {
         "list": list_macros,
         "devices": cmd_devices,
-        "record": lambda: record_macro(args.name, getattr(args, "device", None), getattr(args, "yes", False)),
+        "record": lambda: record_macro(args.name, getattr(args, "device", None),
+                                       getattr(args, "yes", False)),
         "play": lambda: play_macro(
-            args.name,
-            getattr(args, "loops", 1),
+            args.name, getattr(args, "loops", 1),
             getattr(args, "screenshot_at", None),
-            getattr(args, "screenshot_dir", None),
-        ),
+            getattr(args, "screenshot_dir", None)),
         "delete": lambda: delete_macro(args.name),
         "import": lambda: import_macros(args.path, getattr(args, "yes", False)),
+        "orchestrate": lambda: orchestrate(args.config, getattr(args, "loops", 1)),
+        "ocr-test": lambda: cmd_ocr_test(args.region),
     }
     cmds[args.command]()
 

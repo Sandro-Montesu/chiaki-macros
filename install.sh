@@ -15,7 +15,7 @@ echo
 # ── 1. System dependencies ──────────────────────────────────────────
 echo "[1/5] Installing system packages..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3-evdev
+sudo apt-get install -y -qq python3-evdev tesseract-ocr
 
 # ── 2. uinput permissions (idempotent) ──────────────────────────────
 echo "[2/5] Setting up /dev/uinput permissions..."
