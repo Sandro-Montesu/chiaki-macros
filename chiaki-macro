@@ -428,6 +428,63 @@ def delete_macro(name):
     print(f"Deleted: {name}")
 
 
+def import_macros(path, force=False):
+    """Merge macros from an external JSON file into the current config."""
+    if not os.path.exists(path):
+        print(f"ERROR: File not found: {path}")
+        sys.exit(1)
+    try:
+        with open(path, "r") as f:
+            src = json.load(f)
+    except Exception as e:
+        print(f"ERROR: Cannot read {path}: {e}")
+        sys.exit(1)
+
+    src_macros = src.get("macros", {})
+    if not src_macros:
+        print("No macros found in file.")
+        return
+
+    data = load_macros()
+    current = data.get("macros", {})
+    imported = 0
+    skipped = 0
+
+    print(f"Importing from: {path}")
+    print(f"Source macros:  {len(src_macros)}")
+    print()
+
+    for name, macro in sorted(src_macros.items()):
+        if name in current:
+            if force:
+                current[name] = macro
+                imported += 1
+                print(f"  {name}  ->  overwritten")
+            else:
+                try:
+                    ans = input(f"  {name} already exists. Overwrite? [y/N] ")
+                except EOFError:
+                    ans = "n"
+                if ans.lower() in ("y", "yes"):
+                    current[name] = macro
+                    imported += 1
+                    print(f"    overwritten")
+                else:
+                    skipped += 1
+                    print(f"    skipped")
+        else:
+            current[name] = macro
+            imported += 1
+            print(f"  {name}  ->  imported")
+
+    data["macros"] = current
+    save_macros(data)
+
+    print()
+    print(f"Done: {imported} imported, {skipped} skipped")
+    print(f"Config: {MACROS_FILE}")
+
+
 def cmd_devices():
     print("Input devices:\n")
     for path in sorted(list_devices()):
@@ -456,6 +513,9 @@ def main():
     p.add_argument("--screenshot-dir", help="Directory for screenshots (default: ~/chiaki-screenshots)")
     p = sub.add_parser("delete", help="Delete a macro")
     p.add_argument("name", help="Macro name")
+    p = sub.add_parser("import", help="Import macros from another config file")
+    p.add_argument("path", help="Path to macros.json file")
+    p.add_argument("-y", "--yes", action="store_true", help="Overwrite all existing macros without asking")
     args = parser.parse_args()
 
     cmds = {
@@ -469,6 +529,7 @@ def main():
             getattr(args, "screenshot_dir", None),
         ),
         "delete": lambda: delete_macro(args.name),
+        "import": lambda: import_macros(args.path, getattr(args, "yes", False)),
     }
     cmds[args.command]()
 
