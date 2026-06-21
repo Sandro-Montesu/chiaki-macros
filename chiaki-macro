@@ -31,6 +31,26 @@ K_TS = "ts"
 K_EVENTS = "e"
 
 
+# ── Logging helpers ─────────────────────────────────────────────────
+
+class _Tee:
+    """Duplicate writes to multiple file objects."""
+    def __init__(self, *files):
+        self._files = files
+    def write(self, data):
+        for f in self._files:
+            f.write(data)
+    def flush(self):
+        for f in self._files:
+            f.flush()
+
+def _setup_log(path):
+    """Redirect stdout to both console and a log file."""
+    log = open(path, "a", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, log)
+    print(f"[log: {path}]")
+
+
 # ── Device profile ──────────────────────────────────────────────────
 
 def capture_device_profile(dev):
@@ -152,6 +172,16 @@ def _replay_one_loop(vpad, frames, duration_us, *,
 
 def _screenshot_sync(filepath):
     """Take a screenshot synchronously (blocks until done)."""
+    _screenshot_async_bg(filepath)
+    # Wait for file to appear
+    deadline = time.perf_counter() + 8
+    while not os.path.exists(filepath) and time.perf_counter() < deadline:
+        time.sleep(0.1)
+    return os.path.exists(filepath)
+
+
+def _screenshot_async_bg(filepath):
+    """Launch screenshot in a background subprocess — returns immediately."""
     code = f'''
 import dbus, dbus.mainloop.glib, os, shutil
 from dbus.mainloop.glib import DBusGMainLoop
@@ -177,27 +207,89 @@ if uri and uri.startswith("file://"):
         shutil.move(src, "{filepath}")
 '''
     try:
-        subprocess.run([sys.executable, "-c", code], timeout=8,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return os.path.exists(filepath)
+        subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     except Exception:
-        return False
+        pass
 
 
 def _ocr_read_number(image_path, whitelist="0123456789"):
-    """Run tesseract OCR on an image, return parsed integer or None."""
+    """OCR with preprocessing optimized for speed (Pi Zero) and accuracy.
+    Uses Otsu binarization + 2x upscale + majority voting across 3 PSM modes."""
     try:
-        r = subprocess.run(
-            ["tesseract", image_path, "stdout",
-             "--psm", "7",
-             "-c", f"tessedit_char_whitelist={whitelist}"],
-            capture_output=True, text=True, timeout=8,
-        )
-        text = r.stdout.strip()
-        match = re.search(r'\d+', text)
-        return int(match.group()) if match else None
+        from PIL import Image, ImageOps
+
+        img = Image.open(image_path).convert("L")
+
+        # 2x upscale (fast enough for Pi Zero)
+        img = img.resize((img.width * 2, img.height * 2), Image.LANCZOS)
+
+        def try_ocr(preproc_img):
+            preproc_img.save("/tmp/_chiaki_ocr_tmp.png")
+            results = []
+            for psm in (7, 8, 6):
+                r = subprocess.run(
+                    ["tesseract", "/tmp/_chiaki_ocr_tmp.png", "stdout",
+                     "--psm", str(psm), "--oem", "1",
+                     "-c", f"tessedit_char_whitelist={whitelist}"],
+                    capture_output=True, text=True, timeout=6,
+                )
+                text = r.stdout.strip()
+                match = re.search(r'\d+', text)
+                if match:
+                    results.append(int(match.group()))
+            return results
+
+        # Attempt 1: Otsu auto-threshold
+        hist = img.histogram()
+        otsu_thresh = _otsu_threshold(hist)
+        img1 = img.point(lambda p: 0 if p < otsu_thresh else 255)
+        img1 = ImageOps.invert(img1)
+        img1 = ImageOps.expand(img1, border=2, fill=255)
+        results = try_ocr(img1)
+
+        # If modes disagree, try simpler global threshold
+        if len(set(results)) > 1 and results:
+            img2 = img.point(lambda p: 0 if p < 140 else 255)
+            img2 = ImageOps.invert(img2)
+            img2 = ImageOps.expand(img2, border=2, fill=255)
+            results2 = try_ocr(img2)
+            results.extend(results2)
+
+        if results:
+            return max(set(results), key=results.count)
+        return None
     except Exception:
         return None
+
+
+def _otsu_threshold(hist):
+    """Compute Otsu's optimal threshold from image histogram."""
+    total = sum(hist)
+    if total == 0:
+        return 128
+    sum_b = 0
+    w_b = 0
+    maximum = 0
+    threshold = 0
+    sum_total = sum(i * h for i, h in enumerate(hist))
+    for i, h in enumerate(hist):
+        w_b += h
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += i * h
+        m_b = sum_b / w_b
+        m_f = (sum_total - sum_b) / w_f
+        between = w_b * w_f * (m_b - m_f) ** 2
+        if between > maximum:
+            maximum = between
+            threshold = i
+    return max(threshold, 1)
 
 
 def _crop_image(src, dst, region):
@@ -335,7 +427,10 @@ def _save_toml(path, config):
         f.write("\n".join(out) + "\n")
 
 
-def orchestrate(config_path, loops):
+def orchestrate(config_path, loops, log_path=None):
+    if log_path:
+        _setup_log(log_path)
+
     config = _parse_toml(config_path)
     main_cfg = config.get("main", {})
     main_name = main_cfg.get("macro")
@@ -410,40 +505,45 @@ def orchestrate(config_path, loops):
             iteration += 1
             print(f"--- Loop {iteration}" + (f"/{total}" if total else "") + " ---")
 
-            # Play main macro
-            ss_path_ref = [None]
+            # Play main macro — screenshot launched async, never blocks replay
+            ss_file = os.path.join(ocr_dir, f"_ocr_loop{iteration}.png") if ss_at_us else None
 
             def on_ss():
-                path = os.path.join(ocr_dir, f"_ocr_loop{iteration}.png")
-                if _screenshot_sync(path):
-                    ss_path_ref[0] = path
-                return path
+                if ss_file:
+                    _screenshot_async_bg(ss_file)
+                return ss_file
 
-            result = _replay_one_loop(vpad, frames, duration_us,
-                                       screenshot_at_us=ss_at_us,
-                                       on_screenshot=on_ss if ss_at_us else None)
+            _replay_one_loop(vpad, frames, duration_us,
+                             screenshot_at_us=ss_at_us,
+                             on_screenshot=on_ss if ss_at_us else None)
 
-            # OCR check
-            if ss_path_ref[0] and region:
-                ss_file = ss_path_ref[0]
-                crop_file = ss_file.replace(".png", "_crop.png")
-                if _crop_image(ss_file, crop_file, region):
-                    level = _ocr_read_number(crop_file, whitelist)
-                    print(f"  [OCR] level: {level if level is not None else 'N/A'}")
-                    if level is not None and pending_tasks:
-                        for ti, (orig_idx, t) in enumerate(pending_tasks):
-                            req = t.get("level_req", 999)
-                            if level >= req and t["name"] in task_macros:
-                                et = t.get("execute_time", "after_current_macro")
-                                if et == "after_current_macro":
-                                    tp, tf, td = task_macros[t["name"]]
-                                    print(f"  [TASK] {t['name']} (req {req}) → playing {t['macro']}...")
-                                    _replay_one_loop(vpad, tf, td)
-                                    t["completed"] = True
-                                    tasks[orig_idx]["completed"] = True
-                                    _save_toml(config_path, config)
-                                    print(f"  [TASK] completed, config saved.")
-                                break  # one task per loop
+            # OCR check: wait for async screenshot, then process
+            if ss_file and region:
+                deadline = time.perf_counter() + 8
+                while not os.path.exists(ss_file) and time.perf_counter() < deadline:
+                    time.sleep(0.1)
+                if os.path.exists(ss_file):
+                    crop_file = ss_file.replace(".png", "_crop.png")
+                    if _crop_image(ss_file, crop_file, region):
+                        level = _ocr_read_number(crop_file, whitelist)
+                        print(f"  [OCR] level: {level if level is not None else 'N/A'}")
+                        if level is not None and pending_tasks:
+                            for ti, (orig_idx, t) in enumerate(pending_tasks):
+                                req = t.get("level_req", 999)
+                                if level >= req and t["name"] in task_macros:
+                                    et = t.get("execute_time", "after_current_macro")
+                                    if et == "after_current_macro":
+                                        tp, tf, td = task_macros[t["name"]]
+                                        print(f"  [TASK] {t['name']} (req {req}) → playing {t['macro']}...")
+                                        _replay_one_loop(vpad, tf, td)
+                                        t["completed"] = True
+                                        tasks[orig_idx]["completed"] = True
+                                        _save_toml(config_path, config)
+                                        print(f"  [TASK] completed, config saved.")
+                                    break  # one task per loop
+                else:
+                    print(f"  [OCR] screenshot not ready, skipping")
+                    os.remove(ss_file) if os.path.exists(ss_file) else None
 
             # Remove completed tasks from pending list
             pending_tasks = [(idx, t) for idx, t in pending_tasks if not t.get("completed", False)]
@@ -466,7 +566,13 @@ def orchestrate(config_path, loops):
 
 # ── ocr-test ────────────────────────────────────────────────────────
 
-def cmd_ocr_test(region_str):
+def cmd_ocr_test(region_str, interactive=False):
+    if interactive:
+        _ocr_test_interactive()
+        return
+    if not region_str:
+        print("ERROR: --region is required when not using --interactive")
+        sys.exit(1)
     region = parse_region(region_str)
     ss_path = "/tmp/chiaki-ocr-test.png"
     crop_path = "/tmp/chiaki-ocr-test-crop.png"
@@ -486,6 +592,36 @@ def cmd_ocr_test(region_str):
     print(f"OCR result:      {number if number is not None else 'N/A (no digits found)'}")
     if number is not None:
         print(f"Parsed integer:  {number}")
+
+
+def _ocr_test_interactive():
+    """Take a screenshot and try to open it for coordinate inspection."""
+    ss_path = "/tmp/chiaki-ocr-interactive.png"
+    print("Taking screenshot...")
+    if not _screenshot_sync(ss_path):
+        print("ERROR: Screenshot failed.")
+        sys.exit(1)
+
+    print(f"Screenshot saved: {ss_path}")
+    print()
+
+    # Try to open with available image viewer (prefer ones showing coords)
+    viewers = ["gimp", "eog", "ristretto", "gwenview", "feh", "display"]
+    opened = False
+    for viewer in viewers:
+        if subprocess.run(["which", viewer], capture_output=True).returncode == 0:
+            subprocess.Popen([viewer, ss_path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"Opened in {viewer}.")
+            opened = True
+            break
+    if not opened:
+        print("Open the image manually.")
+    print()
+    print("Find the pixel rectangle of the level number (x, y, width, height).")
+    print("In GIMP: the bottom-left shows coords. Select a rectangle for x,y,w,h.")
+    print("Then run:")
+    print('  chiaki-macro ocr-test --region "x,y,w,h"')
 
 
 # ── record_macro ────────────────────────────────────────────────────
@@ -742,6 +878,281 @@ def cmd_devices():
             pass
 
 
+def cmd_orchestrate_init(path):
+    """Interactive wizard to create an orchestration config."""
+    data = load_macros()
+    macros = data.get("macros", {})
+    if not macros:
+        print("ERROR: No macros saved. Record at least one macro first.")
+        sys.exit(1)
+
+    if os.path.exists(path):
+        ans = input(f"File '{path}' exists. Overwrite? [y/N] ")
+        if ans.lower() not in ("y", "yes"):
+            print("Aborted.")
+            sys.exit(0)
+
+    B = "\033[1m"
+    C = "\033[36m"
+    G = "\033[32m"
+    Y = "\033[33m"
+    R = "\033[0m"
+
+    # Build sorted macro list for menus
+    macro_list = sorted(macros.items())
+    macro_names = [n for n, _ in macro_list]
+
+    def pick_macro(prompt, allow_none=False):
+        print(f"\n{B}{prompt}{R}")
+        for i, (n, m) in enumerate(macro_list):
+            dur = m.get("duration_us", 0) // 1000
+            src = m.get("device_profile", {}).get("name", "?")
+            print(f"  {C}{i+1:>2}{R}. {n:<25s}  {Y}{dur//1000}.{dur%1000:01d}s{R}  ({src})")
+        if allow_none:
+            print(f"  {C} 0{R}. {Y}[skip]{R}")
+        while True:
+            try:
+                ans = input(f"Select [1-{len(macro_list)}]: ").strip()
+                if allow_none and ans == "0":
+                    return None
+                idx = int(ans) - 1
+                if 0 <= idx < len(macro_list):
+                    return macro_names[idx]
+            except (ValueError, EOFError):
+                pass
+            print("Invalid choice.")
+
+    def ask_float(prompt, default=None):
+        d = f" [{default}]" if default is not None else ""
+        while True:
+            try:
+                ans = input(f"{prompt}{d}: ").strip()
+                if not ans and default is not None:
+                    return default
+                return float(ans)
+            except (ValueError, EOFError):
+                pass
+            print("Enter a number (e.g. 23.5).")
+
+    def ask_int(prompt, default=None):
+        d = f" [{default}]" if default is not None else ""
+        while True:
+            try:
+                ans = input(f"{prompt}{d}: ").strip()
+                if not ans and default is not None:
+                    return default
+                return int(ans)
+            except (ValueError, EOFError):
+                pass
+            print("Enter an integer.")
+
+    def ask_str(prompt, default=""):
+        d = f" [{default}]" if default else ""
+        ans = input(f"{prompt}{d}: ").strip()
+        return ans if ans else default
+
+    def ask_bool(prompt, default=True):
+        hint = "Y/n" if default else "y/N"
+        ans = input(f"{prompt} [{hint}]: ").strip().lower()
+        if not ans:
+            return default
+        return ans in ("y", "yes")
+
+    # ── Header ──
+    print(f"\n{B}{'─'*60}{R}")
+    print(f"  {B}chiaki-macro orchestrate config generator{R}")
+    print(f"{B}{'─'*60}{R}")
+
+    # ── Step 1: Main macro ──
+    main_macro = pick_macro(f"Step 1/{C}3{R}: Select the {B}main macro{R}")
+    print(f"  {G}→ main.macro = \"{main_macro}\"{R}")
+
+    # ── Step 2: OCR ──
+    print()
+    enable_ocr = ask_bool(f"Step 2/{C}3{R}: Enable OCR level check?", True)
+    ocr_at_s = None
+    region = ""
+    whitelist = "0123456789"
+
+    if enable_ocr:
+        ocr_at_s = ask_float("  Timestamp in macro (seconds)", 23.5)
+        print(f"  {G}→ OCR at {ocr_at_s}s{R}")
+        if ask_bool("  Calibrate region interactively now? (opens screenshot)", True):
+            _ocr_test_interactive()
+            print()
+            region = ask_str("  Paste region (x,y,w,h)")
+        else:
+            region = ask_str("  Region (x,y,w,h)", "800,50,200,40")
+        whitelist = ask_str("  OCR whitelist characters", "0123456789")
+        print(f"  {G}→ region = \"{region}\"{R}")
+
+    # ── Step 3: Tasks ──
+    print()
+    print(f"Step 3/{C}3{R}: {B}Tasks{R} (triggered when level >= requirement)")
+    tasks = []
+    if ask_bool("Add tasks?", True):
+        while True:
+            print(f"\n  {B}── Task #{len(tasks)+1} ──{R}")
+            tname = ask_str("  Name")
+            if not tname:
+                tname = f"task_{len(tasks)+1}"
+            treq = ask_int("  Level required", 1)
+            tmacro = pick_macro(f"  Select macro for this task")
+            print(f"  {G}→ {tname} (req {treq}) → {tmacro}{R}")
+            tasks.append({
+                "name": tname, "level_req": treq,
+                "macro": tmacro,
+                "execute_time": "after_current_macro",
+                "completed": False,
+            })
+            if not ask_bool("  Add another task?", False):
+                break
+
+    # ── Write config ──
+    print(f"\n{B}{'─'*60}{R}")
+    with open(path, "w") as f:
+        f.write("# chiaki-macro orchestration config\n\n")
+        f.write("[main]\n")
+        f.write(f"macro = \"{main_macro}\"\n\n")
+        if enable_ocr:
+            f.write("[ocr]\n")
+            f.write(f"enabled_at_s = {ocr_at_s}\n")
+            f.write(f"region = \"{region}\"\n")
+            f.write(f"whitelist = \"{whitelist}\"\n\n")
+        for t in tasks:
+            f.write("[[task]]\n")
+            f.write(f"name = \"{t['name']}\"\n")
+            f.write(f"level_req = {t['level_req']}\n")
+            f.write(f"macro = \"{t['macro']}\"\n")
+            f.write("execute_time = \"after_current_macro\"\n")
+            f.write("completed = false\n\n")
+
+    print(f"  {G}Saved:{R} {path}")
+    print()
+    print(f"  Run with:")
+    print(f"  {B}chiaki-macro orchestrate {path} -n 100{R}")
+    print()
+
+
+def collage_macro(name, parts):
+    """Concatenate multiple macros into one, adjusting timestamps."""
+    data = load_macros()
+    all_macros = data.get("macros", {})
+
+    # Validate all parts exist
+    missing = [p for p in parts if p not in all_macros]
+    if missing:
+        print(f"ERROR: Macro(s) not found: {', '.join(missing)}")
+        sys.exit(1)
+
+    if name in all_macros:
+        ans = input(f"Macro '{name}' exists. Overwrite? [y/N] ")
+        if ans.lower() not in ("y", "yes"):
+            print("Aborted.")
+            sys.exit(0)
+
+    # Validate all macros use the same device type
+    profiles = []
+    for p in parts:
+        m = all_macros[p]
+        profile = m.get("device_profile", {})
+        if not profile:
+            print(f"ERROR: Macro '{p}' has no device profile. Re-record it.")
+            sys.exit(1)
+        profiles.append(profile)
+
+    ref = profiles[0]
+    vendor = ref.get("vendor", 0)
+    product = ref.get("product", 0)
+    for i, pr in enumerate(profiles):
+        if pr.get("vendor") != vendor or pr.get("product") != product:
+            print(f"WARNING: '{parts[0]}' ({ref.get('name')}) vs '{parts[i]}' ({pr.get('name')})")
+            print("  Different controllers — replay may behave unexpectedly.")
+            break
+
+    # Concatenate frames with adjusted timestamps
+    all_frames = []
+    offset_us = 0
+    total_changes = 0
+
+    for pi, p in enumerate(parts):
+        m = all_macros[p]
+        src_frames = m.get("frames", [])
+        if not src_frames:
+            print(f"ERROR: Macro '{p}' has no frames.")
+            sys.exit(1)
+
+        for frame in src_frames:
+            ts = frame.get(K_TS, frame.get("ts", 0) * 1000)
+            events = frame.get(K_EVENTS, frame.get("events", []))
+
+            if offset_us == 0 and pi == 0:
+                # First frame of first macro: keep as-is
+                all_frames.append({K_TS: ts, K_EVENTS: events})
+            elif pi > 0 and offset_us == 0:
+                # First frame of subsequent macro: skip if it's just initial state
+                # (frame 0 with only ABS events — we already have state from previous macro)
+                pass
+            else:
+                # Skip frame 0 of non-first macros (initial state snapshot)
+                if pi > 0 and ts == 0:
+                    continue
+                all_frames.append({K_TS: ts + offset_us, K_EVENTS: events})
+            total_changes += len(events)
+
+        last_ts = src_frames[-1].get(K_TS, src_frames[-1].get("ts", 0) * 1000)
+        offset_us += last_ts
+
+    total_duration = all_frames[-1][K_TS]
+
+    # Merge first frame of each non-first macro into the transition
+    # Actually, we need the state from the first frame of macro 2 to be present
+    # at the transition point. Let me insert it at offset of previous macro's end.
+    # We need to redo this properly.
+
+    # Simplified: just concatenate all frames, skipping frame 0 of non-first macros
+    all_frames = []
+    offset_us = 0
+
+    for pi, p in enumerate(parts):
+        m = all_macros[p]
+        src_frames = m.get("frames", [])
+
+        for fi, frame in enumerate(src_frames):
+            ts = frame.get(K_TS, frame.get("ts", 0) * 1000)
+            events = list(frame.get(K_EVENTS, frame.get("events", [])))
+
+            if pi > 0 and fi == 0:
+                # Skip frame 0 of subsequent macros (initial state snapshot)
+                # But add its ABS events as frame at the transition point
+                # to set the correct starting position for this segment
+                abs_events = [e for e in events if e.get(K_TYPE, 0) == ecodes.EV_ABS]
+                if abs_events:
+                    all_frames.append({K_TS: offset_us, K_EVENTS: abs_events})
+                continue
+
+            new_ts = ts + offset_us
+            all_frames.append({K_TS: new_ts, K_EVENTS: events})
+
+        last_ts = src_frames[-1].get(K_TS, src_frames[-1].get("ts", 0) * 1000)
+        offset_us += last_ts
+
+    total_duration = all_frames[-1][K_TS]
+
+    data["macros"][name] = {
+        "created": datetime.now().isoformat(),
+        "device_profile": ref,
+        "duration_us": total_duration,
+        "frames": all_frames,
+        "collage_parts": parts,
+    }
+    save_macros(data)
+
+    print(f"Collage '{name}' created from: {' + '.join(parts)}")
+    print(f"Frames: {len(all_frames)}  Duration: {total_duration//1000}ms ({total_duration/1000000:.1f}s)")
+    print(f"Saved: {MACROS_FILE}")
+
+
 # ── main ────────────────────────────────────────────────────────────
 
 def main():
@@ -777,12 +1188,26 @@ def main():
     p.add_argument("config", help="Path to TOML config file")
     p.add_argument("-n", "--loops", type=int, default=1,
                    help="Number of main macro loops (-1=infinite)")
+    p.add_argument("--log", help="Also write all output to this log file")
+
+    p = sub.add_parser("orchestrate-init", help="Interactive config wizard for orchestrate")
+    p.add_argument("path", help="Output TOML config path")
+
+    p = sub.add_parser("collage", help="Concatenate macros into one")
+    p.add_argument("name", help="Name for the new macro")
+    p.add_argument("--parts", nargs="+", required=True,
+                   help="Ordered list of macro names to concatenate")
 
     p = sub.add_parser("ocr-test", help="Test OCR on a screenshot region")
-    p.add_argument("--region", required=True,
+    p.add_argument("--region", required=False,
                    help="Region to OCR, e.g. '800,50,200,40' (x,y,w,h)")
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="Interactive region selection (drag mouse)")
 
     args = parser.parse_args()
+
+    if args.command == "ocr-test" and not args.interactive and not args.region:
+        parser.error("ocr-test requires --region or --interactive")
 
     cmds = {
         "list": list_macros,
@@ -795,8 +1220,12 @@ def main():
             getattr(args, "screenshot_dir", None)),
         "delete": lambda: delete_macro(args.name),
         "import": lambda: import_macros(args.path, getattr(args, "yes", False)),
-        "orchestrate": lambda: orchestrate(args.config, getattr(args, "loops", 1)),
-        "ocr-test": lambda: cmd_ocr_test(args.region),
+        "orchestrate": lambda: orchestrate(args.config, getattr(args, "loops", 1),
+                                            getattr(args, "log", None)),
+        "orchestrate-init": lambda: cmd_orchestrate_init(args.path),
+        "ocr-test": lambda: cmd_ocr_test(getattr(args, "region", None),
+                                          getattr(args, "interactive", False)),
+        "collage": lambda: collage_macro(args.name, args.parts),
     }
     cmds[args.command]()
 

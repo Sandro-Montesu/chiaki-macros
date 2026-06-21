@@ -83,6 +83,10 @@ echo "  chiaki-macro devices"
 echo "  chiaki-macro record my_macro"
 echo "  chiaki-macro play my_macro"
 echo
+echo "Bash completion:"
+echo "  sudo cp chiaki-macro-completion.bash /etc/bash_completion.d/chiaki-macro"
+echo "  (then restart your shell)"
+echo
 if ! groups "$USER" | grep -qw input; then
     echo "NOTE: log out and back in for uinput group to take effect."
 fi
